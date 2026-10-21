@@ -4,7 +4,10 @@
 使用说明：
 1. 手机开启 USB 调试并连接电脑(ATX 服务由 uiautomator2 自动维护)。
 2. 手机停留在活动首页(能看到升级按钮)。
-3. 激活虚拟环境后运行: python auto_upgrade.py
+3. 激活虚拟环境后运行: python auto_upgrade.py [能量阈值]
+   - 能量阈值(可选)：剩余能量低于该值时停止升级，不填默认 5000
+   - 示例: python auto_upgrade.py        (阈值 5000)
+           python auto_upgrade.py 3000   (阈值 3000)
 """
 import uiautomator2 as u2
 from cnocr import CnOcr
@@ -13,6 +16,11 @@ import random
 import re
 import os
 import sys
+
+# 将单次 jsonrpc 调用的默认超时从 300 秒降到 20 秒：
+# 设备端服务劣化(查询挂死)时快速失败，避免脚本长时间卡死
+import uiautomator2.base as _u2base
+_u2base.HTTP_TIMEOUT = 20
 
 # ==========================================
 # 日志系统(与 auto_browers.py 相同方案)：
@@ -191,8 +199,15 @@ def handle_popup_if_any(vision_data):
 # 升级主循环
 # ==========================================
 def start_jump_loop():
-    """长按'升级赛车拿钱'消耗能量的挂机循环"""
-    print("\n🚀 开始执行升级赛车挂机任务...")
+    """长按升级按钮消耗能量的挂机循环"""
+    # 能量阈值：剩余能量低于该值时停止升级；命令行第1个参数可指定，默认 5000
+    try:
+        energy_threshold = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
+    except ValueError:
+        print(f"⚠️ 无效的能量阈值参数 '{sys.argv[1]}'，使用默认值 5000")
+        energy_threshold = 5000
+    print("\n🚀 开始执行升级挂机任务...")
+    print(f"  ⚙️ 能量阈值: {energy_threshold} (剩余能量低于该值将停止升级)")
     jump_count = 0
     fail_streak = 0          # 连续未检测到按钮的次数
     max_fail_streak = 5      # 连续5次按钮缺失则退出
@@ -248,9 +263,9 @@ def start_jump_loop():
         # 4. 能量值判断
         if current_stamina is not None:
             print(f"  🔋 识别到当前能量值: {current_stamina}")
-            if current_stamina < 1000:
+            if current_stamina < energy_threshold:
                 print("\n" + "=" * 40)
-                print(f"🏁 【任务结束】当前能量 ({current_stamina}) 已低于 1000。")
+                print(f"🏁 【任务结束】当前能量 ({current_stamina}) 已低于阈值 {energy_threshold}。")
                 print(f"本次运行共计执行长按升级: {jump_count} 次")
                 print("=" * 40)
                 break

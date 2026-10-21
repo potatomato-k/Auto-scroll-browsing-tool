@@ -1,0 +1,9 @@
+# 核心依赖(已验证版本，与脚本内的版本检查保持一致)
+uiautomator2==3.7.0
+cnocr==2.3.3
+
+# ⚠️ 必须固定 rapidocr 版本：3.10+ 与 cnstd 不兼容，
+#    导入 cnocr 时会报 ImportError: cannot import name 'resolve_model_key'
+rapidocr==3.9.2
+
+Pillow>=10.0

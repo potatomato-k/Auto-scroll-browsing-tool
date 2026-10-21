@@ -1,6 +1,6 @@
 # 安卓手机任务自动化脚本
 
-基于 **uiautomator2（USB 控制 + 无障碍节点）+ CnOcr（屏幕文字识别）** 的安卓手机自动化脚本，通过"截图 OCR 识别 + 无障碍节点查询"双通道理解屏幕内容，模拟真人操作（随机轨迹、随机压力、随机等待）完成电商 App 活动页的浏览类与升级类任务。
+基于 **uiautomator2（USB 控制 + 无障碍节点）+ CnOcr（屏幕文字识别）** 的安卓手机自动化脚本，通过"截图 OCR 识别 + 无障碍节点查询"双通道理解屏幕内容，模拟真人操作（随机轨迹、随机压力、随机等待）完成 App 活动页的浏览类任务与连续长按升级操作。
 
 > ⚠️ 本项目仅供个人学习与技术研究，请勿用于商业用途。使用风险见文末[风险提示](#风险提示)。
 
@@ -24,19 +24,25 @@
 - Windows / macOS / Linux（在 Windows 11 + PowerShell 下测试通过）
 - Python **3.12+**
 - 安卓手机：已开启 **USB 调试**，用 USB 线连接电脑，并已安装目标 App
-- 首次连接时 uiautomator2 会自动向手机安装 ATX Agent（手机上弹出安装提示请允许）
+- 首次通过 USB 连接使用 uiautomator2 时，uiautomator2 3.7.0会推送 u2.jar 到 /data/local/tmp/ 并以 app_process 启动，不安装任何 App（旧版 2.x 可能会安装 ATX App，因此建议使用uiautomator2 3.7.0版本）
 
 ## 安装依赖
 
+> 建议在虚拟环境中安装依赖（如果你不了解虚拟环境是什么，直接在系统 Python 中安装通常也可以）。脚本启动时会自动检查核心包版本，与已验证版本不符会打印提示。
+
+方式一：使用版本清单安装（推荐）
+
 ```powershell
-# 建议使用虚拟环境
-python -m venv .myvenv
-.\.myvenv\Scripts\Activate.ps1   # PowerShell；CMD 用 activate.bat
+pip install -r requirements.txt
+```
 
-pip install uiautomator2 cnocr
+方式二：手动安装（注意固定版本）
 
-# ⚠️ 必须固定 rapidocr 版本（新版与 cnstd 不兼容，会报 ImportError）
-pip install "rapidocr==3.9.2"
+```powershell
+pip install uiautomator2==3.7.0 cnocr==2.3.3
+
+# ⚠️ 建议固定 rapidocr 版本（3.10+ 与 cnstd 不兼容，会报 ImportError）
+pip install rapidocr==3.9.2
 ```
 
 ## 使用方法
@@ -57,7 +63,9 @@ pip install "rapidocr==3.9.2"
 ```powershell
 # 激活虚拟环境后
 python auto_browse.py    # 自动做浏览任务
-python auto_upgrade.py   # 自动长按升级
+
+python auto_upgrade.py            # 自动长按升级(能量低于 5000 时停止)
+python auto_upgrade.py 3000       # 可选参数：指定能量阈值，低于 3000 时停止
 ```
 
 4. 运行日志保存在脚本同目录的 `auto_browse.log` / `auto_upgrade.log`（每次运行自动覆盖），出现异常时查看该文件即可定位问题。

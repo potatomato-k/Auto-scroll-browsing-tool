@@ -6,7 +6,43 @@ import random
 import os
 import sys
 import math
+import re
+import xml.etree.ElementTree as ET
 from PIL import Image
+
+# 将单次 jsonrpc 调用的默认超时从 300 秒降到 20 秒：
+# 设备端服务劣化(节点查询挂死)时快速失败，自动回退 OCR 兜底，避免脚本卡死数分钟
+import uiautomator2.base as _u2base
+_u2base.HTTP_TIMEOUT = 20
+
+# ==========================================
+# 依赖版本检查(与 requirements.txt 保持一致)
+# ==========================================
+EXPECTED_VERSIONS = {
+    "uiautomator2": "3.7.0",
+    "cnocr": "2.3.3",
+    "rapidocr": "3.9.2", # ⚠️ 3.10+ 与 cnstd 不兼容(ImportError)，必须固定
+}
+
+def check_dependencies():
+    """核心依赖版本检查：与已验证版本不符时打印提示(不阻止运行)。
+    版本不一致不一定出问题，但遇到异常时应首先对齐版本。"""
+    from importlib.metadata import version, PackageNotFoundError
+    for pkg, expected in EXPECTED_VERSIONS.items():
+        try:
+            installed = version(pkg)
+        except PackageNotFoundError:
+            print(f"⚠️ 依赖检查: 未安装 {pkg}，请先 pip install -r requirements.txt")
+            continue
+        if installed != expected:
+            if pkg == "rapidocr":
+                print(f"❌ 依赖检查: rapidocr=={installed}，必须为 {expected}"
+                      f"(3.10+ 与 cnstd 不兼容会报 ImportError)。请执行: pip install rapidocr=={expected}")
+            else:
+                print(f"⚠️ 依赖检查: {pkg}=={installed}，已验证版本为 {expected}；"
+                      f"如遇异常请对齐: pip install {pkg}=={expected}")
+
+check_dependencies()
 
 # ==========================================
 # 阶段 1：初始化与全局配置
@@ -38,6 +74,10 @@ def is_task_done_text(text):
     """判断是否为任务完成提示(兼容'任务已完成'与'任务完成'两种写法)"""
     return "任务已完成" in text or "任务完成" in text
 
+# 无障碍节点快速路径"熔断"开关：一旦节点读取失败/超时，本次运行内不再尝试，
+# 后续直接走 OCR(避免每次回到任务大厅都在节点收集上白等一个超时周期)
+u2_fast_path_disabled = False
+
 print("正在加载 AI 视觉模型...")
 ocr = CnOcr()
 
@@ -45,7 +85,14 @@ print("正在连接手机...")
 try:
     d = u2.connect()
     screen_width, screen_height = d.window_size()
+    # 健康检查：正常的 device_info 调用应在 3 秒内返回，过慢说明设备端服务劣化
+    _t0 = time.time()
+    d.device_info
+    _elapsed = time.time() - _t0
     print(f"成功连接设备。屏幕尺寸: {screen_width}x{screen_height}")
+    if _elapsed > 3:
+        print(f"⚠️ 设备端服务响应缓慢(device_info 耗时 {_elapsed:.1f} 秒)。")
+        print("   建议执行: python -m uiautomator2 stop 后重新运行脚本；仍慢则重启手机。")
 except Exception as e:
     print(f"手机连接失败: {e}")
     exit()
@@ -135,18 +182,45 @@ def get_screen_vision(region=None):
 
     return vision_data
 
-def u2_region_exists(keyword, y_min, y_max):
-    """快速路径：检查屏幕纵向区域(比例)内是否存在包含关键词的无障碍文本节点。
-    仅原生页面有效；H5 页面查不到节点会返回 False，调用方需回退到 OCR。
-    单次查询约 0.1~0.3 秒，远快于截图+OCR。"""
+_BOUNDS_RE = re.compile(r'\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]')
+
+def u2_text_nodes():
+    """dump_hierarchy 单次调用并解析出所有带文字的节点。
+    返回 [{'text','x','y','cx','cy'}, ...]：x,y 为左上角(与 OCR 坐标同约定)，
+    cx,cy 为节点中心(点击用)。
+    该方法不依赖具体 uiautomator2 版本(dump_hierarchy 2.x/3.x 均有)，
+    且为单次调用，不受页面动画/实例竞态影响(实测动画页面 0.2~2.6 秒稳定)。
+    失败返回 None。"""
     try:
-        for el in d(textContains=keyword):
-            bounds = el.info.get('bounds') or {}
-            top = bounds.get('top', -1)
-            if screen_height * y_min <= top < screen_height * y_max:
-                return True
+        hierarchy = d.dump_hierarchy()
+        root = ET.fromstring(hierarchy)
     except Exception:
-        pass
+        return None
+    nodes = []
+    for node in root.iter('node'):
+        text = node.get('text') or ''
+        if not text:
+            continue
+        m = _BOUNDS_RE.match(node.get('bounds') or '')
+        if not m:
+            continue
+        left, top, right, bottom = (int(v) for v in m.groups())
+        nodes.append({'text': text,
+                      'x': float(left), 'y': float(top),
+                      'cx': (left + right) / 2.0, 'cy': (top + bottom) / 2.0})
+    return nodes
+
+def u2_region_exists(keyword, y_min, y_max):
+    """快速路径：检查屏幕纵向区域(比例)内是否存在包含关键词的文本节点。
+    基于 dump_hierarchy 单次调用+本地解析，不依赖具体 uiautomator2 版本，
+    也不逐元素查询 el.info(实例级查询会与页面动画竞态，可能阻塞数十秒)。
+    H5 页面查不到节点返回 False，调用方需回退到 OCR。"""
+    nodes = u2_text_nodes()
+    if not nodes:
+        return False
+    for item in nodes:
+        if keyword in item['text'] and screen_height * y_min <= item['y'] < screen_height * y_max:
+            return True
     return False
 
 def human_swipe():
@@ -289,26 +363,29 @@ def human_click(x, y):
 def handle_page_1(vision_data):
     """处理页面1：寻找匹配的'去完成'并点击。返回是否成功启动了任务。
     vision_data 为 None 时表示原生页面，直接用无障碍节点获取文本(比OCR快数倍)。"""
+    global u2_fast_path_disabled
     print("  👁️ 视觉判断：当前处于 [页面1-任务大厅]")
+
+    # 熔断：节点读取此前失败过，本次运行内不再尝试，直接全屏 OCR
+    if vision_data is None and u2_fast_path_disabled:
+        vision_data = get_screen_vision()
 
     if vision_data is None:
         # 快速路径：原生页面用无障碍节点直接取任务与按钮
         browse_tasks = []
         buttons_go = []
         try:
-            for kw in TASK_KEYWORDS:
-                for el in d(textContains=kw):
-                    info = el.info
-                    bounds = info.get('bounds') or {}
-                    browse_tasks.append({'text': info.get('text') or kw,
-                                         'x': float(bounds.get('left', 0)),
-                                         'y': float(bounds.get('top', 0))})
-            for el in d(textContains="去完成"):
-                info = el.info
-                bounds = info.get('bounds') or {}
-                buttons_go.append({'text': '去完成',
-                                   'x': float(bounds.get('left', 0)),
-                                   'y': float(bounds.get('top', 0))})
+            # 基于 dump_hierarchy 单次调用+本地解析收集任务与按钮——
+            # 不逐元素 el.info(实例级查询会与页面动画竞态，可能阻塞数十秒)，
+            # 也不依赖新版的 info_list(旧版 uiautomator2 无此方法)
+            text_nodes = u2_text_nodes()
+            if text_nodes is None:
+                raise RuntimeError("dump_hierarchy 调用失败")
+            for item in text_nodes:
+                if is_browse_task_text(item['text']):
+                    browse_tasks.append({'text': item['text'], 'x': item['x'], 'y': item['y']})
+                if "去完成" in item['text']:
+                    buttons_go.append({'text': '去完成', 'x': item['x'], 'y': item['y']})
         except Exception as e:
             print(f"  ⚠️ 无障碍节点读取失败: {e}")
             browse_tasks, buttons_go = [], []
@@ -316,7 +393,9 @@ def handle_page_1(vision_data):
 
         # 修复：u2 能看到页面标题但看不到任务列表(WebView/H5)时，回退全屏 OCR
         if not browse_tasks or not buttons_go:
-            print("  ⚡ 无障碍节点未读到任务/按钮(任务列表可能是WebView)，回退全屏 OCR 扫描...")
+            # 熔断：本次运行内不再尝试节点读取，避免每轮都白等一个超时周期
+            u2_fast_path_disabled = True
+            print("  ⚡ 无障碍节点未读到任务/按钮，回退全屏 OCR 扫描(本次运行内不再尝试节点读取)...")
             vision_data = get_screen_vision()
             browse_tasks = []
             buttons_go = []
@@ -582,16 +661,15 @@ def is_on_page0():
 
 def click_go_earn_energy():
     """点击页面0的'去赚能量'，进入任务大厅。返回是否成功点击。"""
-    # 优先无障碍节点(点击元素中心)
+    # 优先无障碍节点(点击元素中心)；基于 dump 解析，不依赖具体 u2 版本
     try:
-        els = d(textContains="去赚能量")
-        if els.exists:
-            bounds = els[0].info.get('bounds') or {}
-            cx = (bounds.get('left', 0) + bounds.get('right', 0)) / 2
-            cy = (bounds.get('top', 0) + bounds.get('bottom', 0)) / 2
-            human_click(cx, cy)
-            log("页面0: 点击'去赚能量'(u2)")
-            return True
+        nodes = u2_text_nodes()
+        if nodes:
+            for item in nodes:
+                if "去赚能量" in item['text']:
+                    human_click(item['cx'], item['cy'])
+                    log("页面0: 点击'去赚能量'(u2)")
+                    return True
     except Exception:
         pass
     # OCR 回退：点击'去赚能量'文字所在位置
@@ -782,9 +860,9 @@ def main_loop():
                 # 前往执行状态→执行状态→返回大厅(内部含容错)
                 execute_task_session()
                 # 任务间随机休息，模拟真人做任务的节奏(偶尔来一次长休息)
-                rest = random.uniform(2.0, 6.0)
-                if random.random() < 0.15:
-                    rest = random.uniform(15.0, 30.0)
+                rest = random.uniform(1.0, 6.0)
+                if random.random() < 0.10:
+                    rest = random.uniform(6.0, 15.0)
                 print(f"  ☕ 任务间休息 {rest:.1f} 秒后继续...")
                 log(f"任务节奏: 休息{rest:.1f}秒")
                 time.sleep(rest)
